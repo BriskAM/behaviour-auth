@@ -90,6 +90,54 @@ def event_to_vector(
 
 
 # ------------------------------------------------------------------ #
+# Window → sequence feature vector (LSTM input)
+# ------------------------------------------------------------------ #
+
+def window_to_sequence(
+    events: list[KeyEvent],
+    user_stats: Optional[dict] = None,
+    sequence_length: int = 50,
+) -> Optional[np.ndarray]:
+    """
+    Convert a list of KeyEvents into a (sequence_length, 7) sequence of per-event vectors.
+    """
+    if len(events) < sequence_length:
+        return None
+
+    user_stats = user_stats or {}
+    mean_dwell = user_stats.get('mean_dwell', 80.0)
+    mean_flight = user_stats.get('mean_flight', 120.0)
+    mean_digraph = user_stats.get('mean_digraph', 200.0)
+
+    seq = []
+    prev_evt = None
+    for evt in events[:sequence_length]:
+        vec = event_to_vector(evt, prev_evt, mean_dwell, mean_flight, mean_digraph)
+        if vec is None:
+            # Fallback for the first event in the sequence which lacks a predecessor
+            dwell_ms = (evt.release_ts - evt.press_ts) * 1000.0 if evt.release_ts else mean_dwell
+            dwell_norm = dwell_ms / max(mean_dwell, 1.0)
+            cat = evt.key_category
+            cat_vec = [
+                1.0 if cat == 'alphanum' else 0.0,
+                1.0 if cat == 'symbol' else 0.0,
+                1.0 if cat == 'special' else 0.0,
+            ]
+            vec = np.array([
+                dwell_norm,
+                0.0,  # flight_norm
+                0.0,  # digraph_norm
+                *cat_vec,
+                0.3,  # default frequency weight
+            ], dtype=np.float32)
+        seq.append(vec)
+        prev_evt = evt
+
+    return np.stack(seq)
+
+
+
+# ------------------------------------------------------------------ #
 # Window → aggregate feature vector (SVM input)
 # ------------------------------------------------------------------ #
 

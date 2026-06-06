@@ -1,1 +1,29 @@
-.archive
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Project local data / user profiles
+.behaveguard/
+prev runs/
+scratch/
+
+# Archives & duplicates
+Archive.zip
+uv 2.lock
+*.zip
+*.tar.gz
+
+# Archive folder
+.archive/

@@ -6,16 +6,18 @@ score()   — loads profile, runs live scoring session
 """
 from __future__ import annotations
 
+import pickle
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 from rich.console import Console
 
 from behavguard.collector.keystroke import KeyEvent
-from behavguard.features.extractor import window_to_aggregate, WINDOW_FEATURE_DIM
+from behavguard.features.extractor import window_to_aggregate, window_to_sequence, WINDOW_FEATURE_DIM
 from behavguard.model.svm import BehaveGuardSVM
+from behavguard.model.lstm import BehaveGuardLSTM
 from behavguard.storage import store
 
 console = Console()
@@ -64,13 +66,25 @@ def _events_to_windows(
     return windows
 
 
+def _events_to_sequences(
+    events: list[KeyEvent],
+    user_stats: dict,
+) -> list[np.ndarray]:
+    sequences = []
+    for window_events in _slice_windows(events):
+        seq = window_to_sequence(window_events, user_stats)
+        if seq is not None:
+            sequences.append(seq)
+    return sequences
+
+
 # ------------------------------------------------------------------ #
 # Enrollment
 # ------------------------------------------------------------------ #
 
-def enroll(subject_id: str, segment_events: dict[str, list[KeyEvent]]) -> BehaveGuardSVM:
+def enroll(subject_id: str, segment_events: dict[str, list[KeyEvent]], model_type: str = "lstm") -> Any:
     """
-    Train a One-Class SVM from enrollment segments.
+    Train a model (One-Class SVM or LSTM Autoencoder) from enrollment segments.
 
     segment_events keys: 'seg1', 'seg2', 'seg3'
     Training uses seg1 + seg2; seg3 is validation only (threshold calibration).
@@ -88,35 +102,54 @@ def enroll(subject_id: str, segment_events: dict[str, list[KeyEvent]]) -> Behave
     user_stats = _compute_user_stats(train_events)
 
     console.print("[cyan]→ Extracting window features …[/cyan]")
-    train_windows = _events_to_windows(train_events, user_stats)
-    val_windows = _events_to_windows(val_events, user_stats) if val_events else []
+    if model_type == "lstm":
+        train_data = _events_to_sequences(train_events, user_stats)
+        val_data = _events_to_sequences(val_events, user_stats) if val_events else []
+    else:
+        train_data = _events_to_windows(train_events, user_stats)
+        val_data = _events_to_windows(val_events, user_stats) if val_events else []
 
-    console.print(f"  Training windows: [bold]{len(train_windows)}[/bold]")
-    console.print(f"  Validation windows: [bold]{len(val_windows)}[/bold]")
+    console.print(f"  Training windows: [bold]{len(train_data)}[/bold]")
+    console.print(f"  Validation windows: [bold]{len(val_data)}[/bold]")
 
-    if len(train_windows) < MIN_WINDOWS_TO_TRAIN:
+    if len(train_data) < MIN_WINDOWS_TO_TRAIN:
         raise ValueError(
-            f"Only {len(train_windows)} windows extracted — need at least {MIN_WINDOWS_TO_TRAIN}. "
+            f"Only {len(train_data)} windows extracted — need at least {MIN_WINDOWS_TO_TRAIN}. "
             "Type more during enrollment."
         )
 
-    console.print("[cyan]→ Training One-Class SVM …[/cyan]")
-    model = BehaveGuardSVM(nu=0.10)
-    profile = model.fit(train_windows)
+    if model_type == "lstm":
+        console.print("[cyan]→ Training LSTM Autoencoder …[/cyan]")
+        model = BehaveGuardLSTM()
+        profile = model.fit(train_data)
 
-    # If we have validation windows, recalibrate the threshold to their 95th pct
-    if val_windows:
-        val_scores = [-model.profile.svm.decision_function(
-            model.profile.scaler.transform(w.reshape(1, -1))
-        )[0] for w in val_windows]
-        profile.t_anomaly = float(np.percentile(val_scores, 95))
-        console.print(
-            f"  Threshold calibrated on validation set: [bold]{profile.t_anomaly:.4f}[/bold]"
-        )
+        if val_data:
+            val_scores = [model.score_window(w)["raw_decision"] for w in val_data]
+            profile.t_anomaly = float(np.percentile(val_scores, 95))
+            console.print(
+                f"  Threshold calibrated on validation set: [bold]{profile.t_anomaly:.4f}[/bold]"
+            )
+        else:
+            console.print(
+                f"  Threshold (train 95th pct): [bold]{profile.t_anomaly:.4f}[/bold]"
+            )
     else:
-        console.print(
-            f"  Threshold (train 95th pct): [bold]{profile.t_anomaly:.4f}[/bold]"
-        )
+        console.print("[cyan]→ Training One-Class SVM …[/cyan]")
+        model = BehaveGuardSVM(nu=0.10)
+        profile = model.fit(train_data)
+
+        if val_data:
+            val_scores = [-model.profile.svm.decision_function(
+                model.profile.scaler.transform(w.reshape(1, -1))
+            )[0] for w in val_data]
+            profile.t_anomaly = float(np.percentile(val_scores, 95))
+            console.print(
+                f"  Threshold calibrated on validation set: [bold]{profile.t_anomaly:.4f}[/bold]"
+            )
+        else:
+            console.print(
+                f"  Threshold (train 95th pct): [bold]{profile.t_anomaly:.4f}[/bold]"
+            )
 
     # Save
     store.ensure_dirs(subject_id)
@@ -129,7 +162,7 @@ def enroll(subject_id: str, segment_events: dict[str, list[KeyEvent]]) -> Behave
         store.save_enrollment_events(subject_id, seg_label, events)
 
     console.print(f"\n[bold green]✓ Enrollment complete![/bold green]")
-    console.print(f"  Trained on [bold]{len(train_windows)}[/bold] windows from "
+    console.print(f"  Trained on [bold]{len(train_data)}[/bold] windows from "
                   f"[bold]{len(train_events)}[/bold] keystrokes")
     console.print(f"  Anomaly threshold: [bold]{profile.t_anomaly:.4f}[/bold]\n")
 
@@ -153,8 +186,16 @@ def score_live(subject_id: str, duration_seconds: int = 300) -> dict:
         raise RuntimeError(f"No profile found for '{subject_id}'. Run enrollment first.")
 
     console.print(f"[cyan]→ Loading profile for [bold]{subject_id}[/bold] …[/cyan]")
-    model = BehaveGuardSVM()
-    model.load(store.profile_path(subject_id))
+    model_path = store.profile_path(subject_id)
+    with open(model_path, 'rb') as f:
+        profile_data = pickle.load(f)
+
+    if isinstance(profile_data, dict) and profile_data.get('model_type') == 'lstm':
+        model = BehaveGuardLSTM()
+    else:
+        model = BehaveGuardSVM()
+
+    model.load(model_path)
     threshold = model.profile.t_anomaly
 
     # Compute user stats from enrollment for normalisation
@@ -162,7 +203,7 @@ def score_live(subject_id: str, duration_seconds: int = 300) -> dict:
     seg2 = store.load_enrollment_events(subject_id, 'seg2')
     user_stats = _compute_user_stats(seg1 + seg2)
 
-    console.print(f"[green]✓ Profile loaded. Threshold = {threshold:.4f}[/green]")
+    console.print(f"[green]✓ Profile loaded ({type(model).__name__}). Threshold = {threshold:.4f}[/green]")
     console.print(f"[dim]Type normally for {duration_seconds // 60} minutes. "
                   "Press Ctrl+C to stop early.[/dim]\n")
 
@@ -187,7 +228,11 @@ def score_live(subject_id: str, duration_seconds: int = 300) -> dict:
                     window_events = buffer[:WINDOW_SIZE]
                     buffer = buffer[WINDOW_STRIDE:]  # advance by stride
 
-                    feat = window_to_aggregate(window_events, user_stats)
+                    if isinstance(model, BehaveGuardLSTM):
+                        feat = window_to_sequence(window_events, user_stats)
+                    else:
+                        feat = window_to_aggregate(window_events, user_stats)
+
                     if feat is not None:
                         result = model.score_window(feat)
                         window_results.append(result)
