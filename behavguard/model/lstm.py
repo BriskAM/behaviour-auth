@@ -57,6 +57,10 @@ class LSTMAutoencoder(nn.Module):
         )
         self.latent_proj = nn.Linear(32, latent_dim)
 
+        # Decoder State Projections (solves vanishing gradients in sequence-to-sequence)
+        self.dec_h0_proj = nn.Linear(latent_dim, 32)
+        self.dec_c0_proj = nn.Linear(latent_dim, 32)
+
         # Decoder
         self.decoder_lstm1 = nn.LSTM(
             input_size=latent_dim,
@@ -81,8 +85,12 @@ class LSTMAutoencoder(nn.Module):
         # Repeat latent vector seq_len times
         latent_repeated = latent.unsqueeze(1).repeat(1, self.sequence_length, 1)
 
+        # Project latent to decoder initial state (h0, c0)
+        h0 = self.dec_h0_proj(latent).unsqueeze(0)  # [1, batch_size, 32]
+        c0 = self.dec_c0_proj(latent).unsqueeze(0)  # [1, batch_size, 32]
+
         # Decoder
-        dec_out1, _ = self.decoder_lstm1(latent_repeated)
+        dec_out1, _ = self.decoder_lstm1(latent_repeated, (h0, c0))
         dec_out2, _ = self.decoder_lstm2(dec_out1)
         reconstructed = self.decoder_dense(dec_out2)
 
@@ -103,8 +111,8 @@ class BehaveGuardLSTM:
         sequence_length: int = 50,
         feature_dim: int = 7,
         latent_dim: int = 16,
-        epochs: int = 120,   # Increased default epochs for better convergence
-        lr: float = 0.003,    # Adjusted learning rate
+        epochs: int = 250,   # Increased epochs for stable convergence
+        lr: float = 0.01,    # Higher learning rate for better convergence
         batch_size: int = 16,
     ):
         self.sequence_length = sequence_length
