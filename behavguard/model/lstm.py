@@ -163,11 +163,17 @@ class BehaveGuardLSTM:
                 batch = dataset[indices].to(self.device)
 
                 optimizer.zero_grad()
-                recon, _ = self.model(batch)
+                recon, latent = self.model(batch)
 
                 # Custom weighted MSE loss
                 diff = (recon - batch) ** 2
-                loss = (diff * feature_weights).mean()
+                recon_loss = (diff * feature_weights).mean()
+
+                # Compactness loss: pull latents into a tight cluster
+                latent_mean = latent.mean(dim=0, keepdim=True)
+                compactness = ((latent - latent_mean) ** 2).mean()
+
+                loss = recon_loss + 0.2 * compactness
 
                 loss.backward()
                 optimizer.step()
