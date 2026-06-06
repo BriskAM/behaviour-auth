@@ -1,0 +1,5 @@
+numpy
+scipy
+pynput
+scikit-learn
+rich

@@ -1,0 +1,13 @@
+[project]
+name = "claude-svm"
+version = "0.1.0"
+description = "Behavioral continuous authentication via keystroke dynamics"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pynput",
+    "scikit-learn",
+    "rich",
+]
