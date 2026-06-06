@@ -22,7 +22,8 @@ class LSTMEnrollmentProfile:
     """Persisted profile produced by training."""
     model_state_dict: dict
     scaler: StandardScaler
-    t_anomaly: float               # 95th-percentile enrollment error (MSE)
+    t_anomaly: float               # 95th-percentile combined anomaly score
+    t_anomaly_raw: float           # 95th-percentile raw reconstruction error
     enrollment_mean: np.ndarray    # mean per feature dimension for drift
     enrollment_std: np.ndarray     # std per feature dimension
     latent_centroid: np.ndarray    # mean latent vector of enrollment
@@ -93,7 +94,7 @@ class BehaveGuardLSTM:
     LSTM Autoencoder wrapper following BehaveGuard design:
       - Trains on genuine user event sequences only
       - Uses a weighted MSE loss function
-      - Threshold = 95th percentile of enrollment reconstruction errors
+      - Threshold = 95th percentile of enrollment reconstruction errors + latent distance
       - Scores new windows -> {score, verdict}
     """
 
@@ -102,8 +103,8 @@ class BehaveGuardLSTM:
         sequence_length: int = 50,
         feature_dim: int = 7,
         latent_dim: int = 16,
-        epochs: int = 80,
-        lr: float = 0.005,
+        epochs: int = 120,   # Increased default epochs for better convergence
+        lr: float = 0.003,    # Adjusted learning rate
         batch_size: int = 16,
     ):
         self.sequence_length = sequence_length
@@ -179,7 +180,7 @@ class BehaveGuardLSTM:
                 raw_errors.append(err)
                 latents_list.append(latent.cpu().numpy()[0])
 
-        t_anomaly = float(np.percentile(raw_errors, 95))
+        t_anomaly_raw = float(np.percentile(raw_errors, 95))
         
         # Latent centroid and radius
         latents = np.stack(latents_list)
@@ -187,10 +188,20 @@ class BehaveGuardLSTM:
         latent_distances = np.linalg.norm(latents - latent_centroid, axis=1)
         latent_radius = float(np.percentile(latent_distances, 95))
 
+        # Calculate combined scores for initial t_anomaly threshold setting
+        combined_scores = []
+        for err, lat in zip(raw_errors, latents_list):
+            l_dist = np.linalg.norm(lat - latent_centroid)
+            norm_recon = err / t_anomaly_raw if t_anomaly_raw > 0 else err
+            norm_latent = l_dist / latent_radius if latent_radius > 0 else l_dist
+            combined_scores.append(0.5 * norm_recon + 0.5 * norm_latent)
+        t_anomaly = float(np.percentile(combined_scores, 95))
+
         self._profile = LSTMEnrollmentProfile(
             model_state_dict=self.model.state_dict(),
             scaler=scaler,
             t_anomaly=t_anomaly,
+            t_anomaly_raw=t_anomaly_raw,
             enrollment_mean=np.mean(X_flat, axis=0),
             enrollment_std=np.std(X_flat, axis=0) + 1e-8,
             latent_centroid=latent_centroid,
@@ -209,7 +220,7 @@ class BehaveGuardLSTM:
 
         Returns:
           anomaly_score : float ∈ [0, 1]  (0=legitimate, 1=impostor)
-          raw_decision  : float (Weighted MSE reconstruction error)
+          raw_decision  : float (Combined reconstruction + latent distance score)
           verdict       : 'legitimate' | 'uncertain' | 'anomaly'
           threshold     : the T_anomaly used
         """
@@ -231,20 +242,30 @@ class BehaveGuardLSTM:
         with torch.no_grad():
             recon, latent = self.model(batch)
             diff = (recon - batch) ** 2
-            raw = float((diff * feature_weights).mean().item())
+            raw_recon = float((diff * feature_weights).mean().item())
+            
+        latent_vec = latent.cpu().numpy()[0]
+        latent_dist = float(np.linalg.norm(latent_vec - p.latent_centroid))
+
+        # Normalize score components relative to training maximums
+        norm_recon = raw_recon / p.t_anomaly_raw if p.t_anomaly_raw > 0 else raw_recon
+        norm_latent = latent_dist / p.latent_radius if p.latent_radius > 0 else latent_dist
+
+        # Combined score (averaging components)
+        combined_score = 0.5 * norm_recon + 0.5 * norm_latent
 
         # Normalise: 0.0 = right at threshold, scale by threshold magnitude
         if p.t_anomaly > 0:
-            norm_score = raw / (p.t_anomaly * 2.0)
+            norm_score = combined_score / (p.t_anomaly * 2.0)
         else:
-            norm_score = raw / 2.0
+            norm_score = combined_score / 2.0
         anomaly_score = float(np.clip(norm_score, 0.0, 1.0))
 
-        verdict = _verdict(raw, p.t_anomaly)
+        verdict = _verdict(combined_score, p.t_anomaly)
 
         return {
             'anomaly_score': anomaly_score,
-            'raw_decision': raw,
+            'raw_decision': combined_score,
             'verdict': verdict,
             'threshold': p.t_anomaly,
         }
@@ -285,6 +306,7 @@ class BehaveGuardLSTM:
             'model_state_dict': state_dict_cpu,
             'scaler': self._profile.scaler,
             't_anomaly': self._profile.t_anomaly,
+            't_anomaly_raw': self._profile.t_anomaly_raw,
             'enrollment_mean': self._profile.enrollment_mean,
             'enrollment_std': self._profile.enrollment_std,
             'latent_centroid': self._profile.latent_centroid,
@@ -303,6 +325,7 @@ class BehaveGuardLSTM:
             model_state_dict=profile_data['model_state_dict'],
             scaler=profile_data['scaler'],
             t_anomaly=profile_data['t_anomaly'],
+            t_anomaly_raw=profile_data.get('t_anomaly_raw', profile_data['t_anomaly'] * 0.7),
             enrollment_mean=profile_data['enrollment_mean'],
             enrollment_std=profile_data['enrollment_std'],
             latent_centroid=profile_data['latent_centroid'],
